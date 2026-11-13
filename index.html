@@ -974,6 +974,14 @@
             centerMapWithOffset(lat, lng, getInitialZoom(), true);
             showToast('📍', `Ws4Tech: Local selecionado: ${name}`);
         }
+        // Registro obrigatório do Service Worker para instalação nativa no Android/Chrome
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js')
+                    .then(() => console.log('Service Worker Ws4Tech ativo!'))
+                    .catch((err) => console.warn('Erro no Service Worker:', err));
+            });
+        }
     </script>
 </body>
 </html>
