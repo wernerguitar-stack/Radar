@@ -1,4 +1,4 @@
-       <!DOCTYPE html>
+      <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
@@ -117,6 +117,14 @@
             -webkit-backdrop-filter: blur(18px);
             border: 1px solid rgba(248, 113, 113, 0.55);
             box-shadow: 0 8px 32px rgba(153, 27, 27, 0.45);
+        }
+
+        .glass-approach {
+            background: rgba(12, 74, 110, 0.86);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+            border: 1px solid rgba(56, 189, 248, 0.45);
+            box-shadow: 0 8px 28px rgba(7, 89, 133, 0.4);
         }
 
         .user-marker-container {
@@ -304,6 +312,15 @@
             </button>
         </div>
 
+        <!-- Banner de Aproximação de Chuva Estimada pelo Histórico do Radar -->
+        <div id="approach-forecast-banner" class="hidden glass-approach rounded-2xl px-3.5 py-2 flex items-center gap-2.5 pointer-events-auto max-w-lg">
+            <span class="text-lg">🧭</span>
+            <div class="text-xs">
+                <div id="approach-title" class="font-bold text-sky-100">Núcleo de chuva se aproximando</div>
+                <div id="approach-detail" class="text-[11px] text-sky-200">Calculando trajetória...</div>
+            </div>
+        </div>
+
         <!-- Banner de Alerta de Chuva Forte / Temporal no Local -->
         <div id="heavy-rain-alert" class="hidden glass-alert rounded-2xl px-3.5 py-2 flex items-center gap-2.5 pointer-events-auto max-w-lg animate-pulse">
             <span class="text-lg">⛈️</span>
@@ -421,6 +438,7 @@
         let isSheetCollapsed = false;
 
         let radarFrames = [];
+        let pastRadarFrames = [];
         let radarLayers = {};
         let currentFrameIndex = 0;
         let radarAnimationTimer = null;
@@ -430,6 +448,7 @@
         let latestModelWeather = { code: 0, desc: 'Céu limpo', icon: '☀️', precip: 0 };
         let radarSevereOverLocation = false;
         let radarModerateOverLocation = false;
+        let approachEstimate = null;
         const tilePixelCache = new Map();
 
         let splashDismissed = false;
@@ -666,6 +685,7 @@
             setMapMarker(lat, lng, label);
             fetchWeatherForecast(lat, lng);
             evaluateRadarIntensityAtLocation();
+            estimateApproachingClouds();
         }
 
         function reconcileWeatherDisplay() {
@@ -674,6 +694,9 @@
             const precipBadge = document.getElementById('current-precip-badge');
             const alertBanner = document.getElementById('heavy-rain-alert');
             const alertDetail = document.getElementById('heavy-rain-alert-detail');
+            const approachBanner = document.getElementById('approach-forecast-banner');
+            const approachTitle = document.getElementById('approach-title');
+            const approachDetail = document.getElementById('approach-detail');
 
             const precip = latestModelWeather.precip || 0;
             const isTorrential = precip >= 8.0 || (radarSevereOverLocation && precip >= 2.0);
@@ -713,6 +736,16 @@
                 descEl.textContent = latestModelWeather.desc;
                 descEl.className = 'text-xs sm:text-sm font-medium text-slate-300 truncate';
                 alertBanner.classList.add('hidden');
+            }
+
+            if (!isHeavy && !isTorrential && approachEstimate && approachEstimate.etaMinutes <= 60) {
+                approachBanner.classList.remove('hidden');
+                approachTitle.textContent = approachEstimate.severe
+                    ? `Núcleo forte se aproximando (${approachEstimate.fromDir})`
+                    : `Chuva se aproximando (${approachEstimate.fromDir})`;
+                approachDetail.textContent = `~${approachEstimate.distanceKm.toFixed(1)} km • chegada estimada em ~${approachEstimate.etaMinutes} min (${approachEstimate.speedKmh.toFixed(0)} km/h)`;
+            } else {
+                approachBanner.classList.add('hidden');
             }
         }
 
@@ -864,6 +897,166 @@
             return promise;
         }
 
+        function classifyPixel(r, g, b, a) {
+            if (a <= 60) return 0; // sem chuva
+            if (r > 200 && g < 130) return 2; // chuva forte / temporal
+            return 1; // chuva fraca/moderada
+        }
+
+        function haversineKm(lat1, lng1, lat2, lng2) {
+            const R = 6371;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLng = (lng2 - lng1) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) ** 2 +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLng / 2) ** 2;
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        function getCompassFromDirection(dLatKm, dLngKm) {
+            // Vetor apontando DE onde a nuvem vem PARA o usuário: (-dLatKm, -dLngKm)
+            const fromNorth = -dLatKm;
+            const fromEast = -dLngKm;
+            const angle = (Math.atan2(fromEast, fromNorth) * 180 / Math.PI + 360) % 360;
+            const dirs = ['N', 'NE', 'L', 'SE', 'S', 'SO', 'O', 'NO'];
+            return dirs[Math.round(angle / 45) % 8];
+        }
+
+        async function sampleRainCellsInRadius(frame, radiusKm = 35, stepKm = 4) {
+            const cells = [];
+            const latStep = stepKm / 111.32;
+            const lngStep = stepKm / (111.32 * Math.cos(currentCoords.lat * Math.PI / 180) || 1);
+            const steps = Math.ceil(radiusKm / stepKm);
+
+            for (let iy = -steps; iy <= steps; iy++) {
+                for (let ix = -steps; ix <= steps; ix++) {
+                    const cLat = currentCoords.lat + iy * latStep;
+                    const cLng = currentCoords.lng + ix * lngStep;
+                    const dist = haversineKm(currentCoords.lat, currentCoords.lng, cLat, cLng);
+                    if (dist > radiusKm) continue;
+
+                    const { z, tileX, tileY, px, py } = latLngToTilePixel(cLat, cLng, 6);
+                    const url = `${radarHost}${frame.path}/256/${z}/${tileX}/${tileY}/2/1_1.png`;
+                    const pixels = await getTileImageData(url);
+                    if (!pixels) continue;
+
+                    const idx = (py * 256 + px) * 4;
+                    const level = classifyPixel(pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]);
+                    if (level > 0) {
+                        cells.push({ lat: cLat, lng: cLng, level, dist });
+                    }
+                }
+            }
+            return cells;
+        }
+
+        async function estimateApproachingClouds() {
+            if (pastRadarFrames.length < 2) {
+                approachEstimate = null;
+                reconcileWeatherDisplay();
+                return;
+            }
+
+            const olderFrame = pastRadarFrames[0];
+            const newerFrame = pastRadarFrames[pastRadarFrames.length - 1];
+            const dtMinutes = (newerFrame.time - olderFrame.time) / 60;
+
+            if (dtMinutes < 5) {
+                approachEstimate = null;
+                reconcileWeatherDisplay();
+                return;
+            }
+
+            const [cellsOld, cellsNew] = await Promise.all([
+                sampleRainCellsInRadius(olderFrame, 40, 5),
+                sampleRainCellsInRadius(newerFrame, 40, 5)
+            ]);
+
+            if (cellsOld.length === 0 || cellsNew.length === 0) {
+                approachEstimate = null;
+                reconcileWeatherDisplay();
+                return;
+            }
+
+            // Calcula deslocamento médio (em km/min) pareando células próximas dentro de velocidade realista (8 a 90 km/h)
+            const maxShiftKm = (90 / 60) * dtMinutes;
+            const minShiftKm = (6 / 60) * dtMinutes;
+            let sumVLat = 0;
+            let sumVLng = 0;
+            let matchCount = 0;
+
+            for (const cOld of cellsOld) {
+                let bestNew = null;
+                let bestDist = Infinity;
+                for (const cNew of cellsNew) {
+                    const d = haversineKm(cOld.lat, cOld.lng, cNew.lat, cNew.lng);
+                    if (d >= minShiftKm && d <= maxShiftKm && d < bestDist) {
+                        bestDist = d;
+                        bestNew = cNew;
+                    }
+                }
+                if (bestNew) {
+                    const dLatKm = (bestNew.lat - cOld.lat) * 111.32;
+                    const dLngKm = (bestNew.lng - cOld.lng) * (111.32 * Math.cos(currentCoords.lat * Math.PI / 180) || 1);
+                    sumVLat += dLatKm / dtMinutes;
+                    sumVLng += dLngKm / dtMinutes;
+                    matchCount++;
+                }
+            }
+
+            if (matchCount === 0) {
+                approachEstimate = null;
+                reconcileWeatherDisplay();
+                return;
+            }
+
+            const vLat = sumVLat / matchCount; // km/min (+Norte, -Sul)
+            const vLng = sumVLng / matchCount; // km/min (+Leste, -Oeste)
+            const speedKmMin = Math.hypot(vLat, vLng);
+            const speedKmh = speedKmMin * 60;
+
+            if (speedKmMin < 0.08) {
+                approachEstimate = null;
+                reconcileWeatherDisplay();
+                return;
+            }
+
+            // Procura a célula ativa mais próxima no quadro mais recente que esteja se movendo em direção ao usuário
+            let bestEta = Infinity;
+            let bestInfo = null;
+
+            for (const c of cellsNew) {
+                if (c.dist < 2.5) continue; // já está praticamente sobre o local
+                const toUserLatKm = (currentCoords.lat - c.lat) * 111.32;
+                const toUserLngKm = (currentCoords.lng - c.lng) * (111.32 * Math.cos(currentCoords.lat * Math.PI / 180) || 1);
+                const distKm = Math.hypot(toUserLatKm, toUserLngKm);
+                if (distKm === 0) continue;
+
+                // Componente da velocidade na direção do usuário
+                const dot = (vLat * toUserLatKm + vLng * toUserLngKm) / distKm;
+                if (dot <= 0.05) continue;
+
+                // Distância lateral da trajetória até o ponto do usuário
+                const cross = Math.abs(vLat * toUserLngKm - vLng * toUserLatKm) / speedKmMin;
+                if (cross > 7.5) continue; // passa longe do ponto
+
+                const eta = distKm / dot;
+                if (eta > 2 && eta <= 60 && eta < bestEta) {
+                    bestEta = eta;
+                    bestInfo = {
+                        etaMinutes: Math.round(eta),
+                        distanceKm: distKm,
+                        speedKmh,
+                        fromDir: getCompassFromDirection(vLat, vLng),
+                        severe: c.level >= 2
+                    };
+                }
+            }
+
+            approachEstimate = bestInfo;
+            reconcileWeatherDisplay();
+        }
+
         async function evaluateRadarIntensityAtLocation() {
             if (radarFrames.length === 0 || !map) return;
             const frame = radarFrames[currentFrameIndex];
@@ -882,20 +1075,9 @@
                         const sx = Math.min(255, Math.max(0, px + dx));
                         const sy = Math.min(255, Math.max(0, py + dy));
                         const idx = (sy * 256 + sx) * 4;
-                        const r = pixels[idx];
-                        const g = pixels[idx + 1];
-                        const b = pixels[idx + 2];
-                        const a = pixels[idx + 3];
-
-                        if (a > 60) {
-                            if (r > 200 && g < 130) {
-                                radarSevereOverLocation = true;
-                            } else if (r > 200 && g > 160 && b < 110) {
-                                radarModerateOverLocation = true;
-                            } else if (g > 140 || b > 150) {
-                                radarModerateOverLocation = true;
-                            }
-                        }
+                        const level = classifyPixel(pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]);
+                        if (level === 2) radarSevereOverLocation = true;
+                        else if (level === 1) radarModerateOverLocation = true;
                     }
                 }
             }
@@ -913,6 +1095,7 @@
                 radarHost = data.host || 'https://tilecache.rainviewer.com';
                 const past = data.radar?.past || [];
                 const nowcast = data.radar?.nowcast || [];
+                pastRadarFrames = past;
                 radarFrames = [...past, ...nowcast];
 
                 if (radarFrames.length === 0) return;
@@ -933,6 +1116,7 @@
 
                 updateRadarDisplay();
                 startRadarAnimation();
+                estimateApproachingClouds();
             } catch (err) {
                 console.warn('Radar indisponível:', err);
                 document.getElementById('radar-time-label').textContent = 'Indisponível';
