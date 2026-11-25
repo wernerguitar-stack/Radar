@@ -1,4 +1,4 @@
-      <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
@@ -172,6 +172,24 @@
             white-space: nowrap;
             box-shadow: 0 4px 14px rgba(2, 132, 199, 0.45);
             transform: translate(-50%, -50%);
+        }
+
+        .wind-arrow-wrap {
+            width: 34px;
+            height: 34px;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.9);
+            border: 1.5px solid rgba(56, 189, 248, 0.85);
+            box-shadow: 0 0 14px rgba(56, 189, 248, 0.55);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transform: translate(-50%, -50%);
+        }
+
+        .wind-arrow-wrap.severe {
+            border-color: rgba(248, 113, 113, 0.95);
+            box-shadow: 0 0 14px rgba(248, 113, 113, 0.6);
         }
 
         .no-scrollbar::-webkit-scrollbar {
@@ -403,7 +421,6 @@
                                 <span class="w-1.5 h-1.5 rounded-full bg-sky-400 shrink-0"></span>
                                 <span id="location-label" class="truncate">Obtendo coordenadas...</span>
                             </div>
-                            <!-- Bloco Evidente de Deslocamento das Nuvens no Quadro dos Números -->
                             <div id="sheet-cloud-movement-box" class="mt-2 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-900/90 border border-slate-700/80 text-[11px] text-slate-300">
                                 <span id="sheet-cloud-icon">🧭</span>
                                 <span class="font-semibold text-slate-200">Deslocamento:</span>
@@ -448,10 +465,12 @@
 
     <script>
         const FALLBACK_COORDS = { lat: -25.4284, lng: -49.2733, name: 'Curitiba, PR' };
+        const RADAR_MAX_OPACITY = 0.75;
         let map = null;
         let userMarker = null;
         let movementLine = null;
         let movementOriginMarker = null;
+        let movementArrowMarker = null;
         let currentCoords = { ...FALLBACK_COORDS };
         
         let forecastHoursData = [];
@@ -461,6 +480,8 @@
         let radarFrames = [];
         let pastRadarFrames = [];
         let radarLayers = {};
+        let activeRadarPath = null;
+        let fadeRafId = null;
         let currentFrameIndex = 0;
         let radarAnimationTimer = null;
         let isRadarPlaying = true;
@@ -666,11 +687,19 @@
                 map.removeLayer(movementOriginMarker);
                 movementOriginMarker = null;
             }
+            if (movementArrowMarker) {
+                map.removeLayer(movementArrowMarker);
+                movementArrowMarker = null;
+            }
 
             if (!approachEstimate || !approachEstimate.originLat || !approachEstimate.originLng) return;
 
             const originLatLng = [approachEstimate.originLat, approachEstimate.originLng];
             const targetLatLng = [currentCoords.lat, currentCoords.lng];
+            const midLatLng = [
+                (approachEstimate.originLat + currentCoords.lat) / 2,
+                (approachEstimate.originLng + currentCoords.lng) / 2
+            ];
 
             movementLine = L.polyline([originLatLng, targetLatLng], {
                 color: approachEstimate.severe ? '#f87171' : '#38bdf8',
@@ -686,7 +715,22 @@
                 iconAnchor: [0, 0]
             });
 
+            // Seta apontando no sentido do deslocamento das nuvens (do ponto de origem em direção ao usuário)
+            const arrowIcon = L.divIcon({
+                className: 'custom-wind-arrow',
+                html: `
+                    <div class="wind-arrow-wrap ${approachEstimate.severe ? 'severe' : ''}" style="transform: translate(-50%, -50%) rotate(${approachEstimate.moveBearingDeg || 0}deg);">
+                        <svg class="w-4 h-4 ${approachEstimate.severe ? 'text-red-300' : 'text-sky-300'}" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z"/>
+                        </svg>
+                    </div>
+                `,
+                iconSize: [0, 0],
+                iconAnchor: [0, 0]
+            });
+
             movementOriginMarker = L.marker(originLatLng, { icon: originIcon, interactive: false }).addTo(map);
+            movementArrowMarker = L.marker(midLatLng, { icon: arrowIcon, interactive: false }).addTo(map);
         }
 
         async function locateUser(isManualTrigger = false) {
@@ -762,7 +806,7 @@
             if (approachEstimate && approachEstimate.etaMinutes <= 60) {
                 box.className = 'mt-2 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-xl bg-sky-950/85 border border-sky-400/50 text-[11px] text-sky-200 font-medium';
                 icon.textContent = '🧭';
-                text.textContent = `Vindo de ${approachEstimate.fromDir} • ~${approachEstimate.distanceKm.toFixed(1)} km (${approachEstimate.speedKmh.toFixed(0)} km/h) → chega em ~${approachEstimate.etaMinutes} min`;
+                text.textContent = `Vindo de ${approachEstimate.fromDir} (${approachEstimate.toDir}) • ~${approachEstimate.distanceKm.toFixed(1)} km (${approachEstimate.speedKmh.toFixed(0)} km/h) → chega em ~${approachEstimate.etaMinutes} min`;
 
                 approachBanner.classList.remove('hidden');
                 approachTitle.textContent = approachEstimate.severe
@@ -992,12 +1036,13 @@
             return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
         }
 
-        function getCompassFromDirection(dLatKm, dLngKm) {
-            const fromNorth = -dLatKm;
-            const fromEast = -dLngKm;
-            const angle = (Math.atan2(fromEast, fromNorth) * 180 / Math.PI + 360) % 360;
+        function compassFromVector(northKm, eastKm) {
+            const angle = (Math.atan2(eastKm, northKm) * 180 / Math.PI + 360) % 360;
             const dirs = ['N', 'NE', 'L', 'SE', 'S', 'SO', 'O', 'NO'];
-            return dirs[Math.round(angle / 45) % 8];
+            return {
+                label: dirs[Math.round(angle / 45) % 8],
+                bearingDeg: angle
+            };
         }
 
         async function sampleRainCellsInRadius(frame, radiusKm = 35, stepKm = 4) {
@@ -1117,11 +1162,15 @@
                 const eta = distKm / dot;
                 if (eta > 2 && eta <= 60 && eta < bestEta) {
                     bestEta = eta;
+                    const fromInfo = compassFromVector(-vLat, -vLng);
+                    const toInfo = compassFromVector(vLat, vLng);
                     bestInfo = {
                         etaMinutes: Math.round(eta),
                         distanceKm: distKm,
                         speedKmh,
-                        fromDir: getCompassFromDirection(vLat, vLng),
+                        fromDir: fromInfo.label,
+                        toDir: toInfo.label,
+                        moveBearingDeg: toInfo.bearingDeg,
                         severe: c.level >= 2,
                         originLat: c.lat,
                         originLng: c.lng
@@ -1190,7 +1239,7 @@
                     radarLayers[frame.path] = layer;
                 });
 
-                updateRadarDisplay();
+                updateRadarDisplay(false);
                 startRadarAnimation();
                 estimateApproachingClouds();
             } catch (err) {
@@ -1199,14 +1248,60 @@
             }
         }
 
-        function updateRadarDisplay() {
+        function crossFadeRadarLayer(nextPath, smooth = true) {
+            if (fadeRafId) {
+                cancelAnimationFrame(fadeRafId);
+                fadeRafId = null;
+            }
+
+            const prevPath = activeRadarPath;
+            activeRadarPath = nextPath;
+
+            if (!smooth || !prevPath || prevPath === nextPath) {
+                Object.entries(radarLayers).forEach(([path, layer]) => {
+                    layer.setOpacity(path === nextPath ? RADAR_MAX_OPACITY : 0);
+                });
+                return;
+            }
+
+            const prevLayer = radarLayers[prevPath];
+            const nextLayer = radarLayers[nextPath];
+            const startPrevOpacity = prevLayer ? prevLayer.options.opacity : 0;
+            const duration = 380;
+            const startTime = performance.now();
+
+            Object.entries(radarLayers).forEach(([path, layer]) => {
+                if (path !== prevPath && path !== nextPath) {
+                    layer.setOpacity(0);
+                }
+            });
+
+            function step(now) {
+                const progress = Math.min((now - startTime) / duration, 1);
+                const eased = progress < 0.5
+                    ? 2 * progress * progress
+                    : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+
+                if (prevLayer) prevLayer.setOpacity(startPrevOpacity * (1 - eased));
+                if (nextLayer) nextLayer.setOpacity(RADAR_MAX_OPACITY * eased);
+
+                if (progress < 1) {
+                    fadeRafId = requestAnimationFrame(step);
+                } else {
+                    if (prevLayer && prevPath !== nextPath) prevLayer.setOpacity(0);
+                    if (nextLayer) nextLayer.setOpacity(RADAR_MAX_OPACITY);
+                    fadeRafId = null;
+                }
+            }
+
+            fadeRafId = requestAnimationFrame(step);
+        }
+
+        function updateRadarDisplay(smooth = true) {
             if (radarFrames.length === 0) return;
             const frame = radarFrames[currentFrameIndex];
 
-            Object.values(radarLayers).forEach(l => l.setOpacity(0));
-            if (radarLayers[frame.path]) {
-                radarLayers[frame.path].setOpacity(0.75);
-            }
+            crossFadeRadarLayer(frame.path, smooth);
 
             const date = new Date(frame.time * 1000);
             const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -1240,8 +1335,8 @@
 
             radarAnimationTimer = setInterval(() => {
                 currentFrameIndex = (currentFrameIndex + 1) % radarFrames.length;
-                updateRadarDisplay();
-            }, 900);
+                updateRadarDisplay(true);
+            }, 950);
         }
 
         function stopRadarAnimation() {
@@ -1261,7 +1356,7 @@
         function scrubRadarFrame(val) {
             stopRadarAnimation();
             currentFrameIndex = parseInt(val, 10);
-            updateRadarDisplay();
+            updateRadarDisplay(false);
         }
 
         function toggleSearchModal(show) {
